@@ -1,0 +1,5 @@
+/target
+secret.aml
+test.*
+cat.*
+*.log
