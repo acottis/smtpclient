@@ -36,6 +36,7 @@ pub enum StatusCodes{
     BadCommandSequence, // 503
     AuthenticationRequired, //530
     AuthenticationFailed, //535
+    DomainDoesNotAcceptMail, //556
     Unknown, // For status codes I have no implemented 
 }
 
@@ -55,6 +56,7 @@ impl From<StatusCodes> for String{
             StatusCodes::BadCommandSequence => "503",
             StatusCodes::AuthenticationRequired => "530",
             StatusCodes::AuthenticationFailed => "535",
+            StatusCodes::DomainDoesNotAcceptMail => "556",
             StatusCodes::Unknown => "999",
         };
         v.to_owned()
@@ -85,6 +87,7 @@ impl StatusCodes {
             b"503" => Err(Error::SmtpStatus(Self::BadCommandSequence,full_msg.to_string())),
             b"530" => Err(Error::SmtpStatus(Self::AuthenticationFailed,full_msg.to_string())),
             b"535" => Err(Error::SmtpStatus(Self::AuthenticationRequired,full_msg.to_string())),
+            b"556" => Err(Error::SmtpStatus(Self::DomainDoesNotAcceptMail,full_msg.to_string())),
             _ =>      Err(Error::SmtpStatus(Self::Unknown,full_msg.to_string()))
         }
     }

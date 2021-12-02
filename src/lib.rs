@@ -34,18 +34,17 @@
 //! - ~~Env Variables~~
 //! - ~~한글~~
 //! 
-use std::net::TcpStream;
-use std::io::prelude::{Read, Write, BufRead};
-use std::io::BufReader;
+use std::io::prelude::{Read, Write};
 use std::vec::Vec;
 
-use native_tls::{TlsConnector, TlsStream};
+pub mod stream;
+use stream::Stream;
 
-mod error;
+pub mod error;
 use crate::error::{Result, Error};
+
 mod types;
 pub use types::{ContentType, StatusCodes};
-
 static CRLF: &str = "\r\n";
 
 /// This is the struct that contains the fields required to send an email and Options for the others, \
@@ -79,29 +78,10 @@ pub struct SmtpBuilder{
     filename: Option<String>,
     attachment_content_type: Option<ContentType>,
     body_content_type: ContentType,
-    stream: Option<TcpStream>,
-    tls_stream: Option<TlsStream<TcpStream>>,
     tls: bool,
     auth_plain: bool,
     auth_login: bool,
     raw_bytes: Vec<u8>,
-}
-
-impl Drop for SmtpBuilder{
-    fn drop(&mut self){
-        // Quit if Tcp stream is Some(TCPStream) or Some(TLSStream)
-        if self.stream.is_some() || self.tls_stream.is_some() {
-            match self.command("QUIT".to_string()) {
-                Ok(StatusCodes::ServiceClosed) => {
-                    // Need this to complete the tcp connection when its TLS with a correct FIN rather than RST, not sure why
-                    if self.tls_stream.is_some(){
-                        self.tls_stream.as_mut().unwrap().read_to_end(&mut vec![]).unwrap_or_default();
-                    }
-                }  
-                _ => println!("Could not Quit session: {:?}", self.stream.as_ref().unwrap())
-            };
-        } else { println!("Dropping session to {}:{} without establishing", self.host, self.port) }    
-    }
 }
 
 #[allow(dead_code)]
@@ -117,14 +97,12 @@ impl SmtpBuilder{
             port,
             sender,
             recipient,
-            display_name: None,
             sender_domain,
+            display_name: None,
             subject: None,
             body: None,
             username: None,
             password: None,
-            stream: None,
-            tls_stream: None,
             tls: false,
             auth_plain: false,
             auth_login: false,
@@ -194,14 +172,14 @@ impl SmtpBuilder{
     /// ```
     /// 
     pub fn attach(mut self, file: String, content_type: ContentType) -> Result<Self>{
-        let buf = &mut Vec::new();
+        let buffer = &mut Vec::new();
         let mut stream = std::io::BufReader::new(std::fs::File::open(file.to_owned()).map_err(Error::OpenFile)?);
 
-        stream.read_to_end(buf).map_err(Error::IO)?;
+        stream.read_to_end(buffer).map_err(Error::IO)?;
 
         self.filename = Some(file.to_owned()); 
         self.attachment_content_type = Some(content_type);
-        self.attachment = Some(buf.to_vec());
+        self.attachment = Some(buffer.to_vec());
         Ok(self)
     }
     /// Sends email from raw bytes
@@ -218,134 +196,68 @@ impl SmtpBuilder{
     }
     /// Internal use, initialises a TCP session with an SMTP server and stores the stream in `self.stream`
     /// 
-    fn connect(&mut self) -> Result<()>{
-        //let buf = &mut [0u8; 250];
-        use std::net::ToSocketAddrs;
-        println!("Connecting to {}:{}...", self.host, self.port);
-        let sock = format!("{}:{}", self.host, self.port).to_socket_addrs().unwrap().next().unwrap();
-        self.stream = Some(TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(5)).map_err(Error::IO)?);
+    fn connect(&self) -> Result<Stream>{
+        println!("Connecting to {}:{}...", &self.host, &self.port);
+        let mut stream = Stream::new(&self.host, &self.port);
 
         // Initial connection
-        //self.stream.as_ref().ok_or(Error::TCPStreamNotFound)?.read(buf).map_err(Error::IO)?;
-        let buf = self.read_stream()?;
+        let buffer = stream.read()?;
 
         println!("S: {:?} from {}:{} ({})", 
-            StatusCodes::lookup(&buf)?, 
-            self.host, 
-            self.port, 
-            self.stream.as_ref().ok_or(Error::TCPStreamNotFound)?.peer_addr().map_err(Error::IO)?);
-        Ok(())
+            StatusCodes::lookup(&buffer)?,
+            &self.host, 
+            &self.port, 
+            stream.peer_addr());
+        Ok(stream)
     }
-
-    /// Internal use, uses external crate native_tls to start a TLS session inside our existing TCP stream and stores in `self.tls_stream`
-    /// 
-    pub fn start_tls(&mut self) -> Result<()>{
-
-        self.command("STARTTLS".into())?;
-        let tls_connector = TlsConnector::new().map_err(Error::TLS)?;
-        let stream = self.stream.take().ok_or(Error::TCPStreamNotFound)?;
-        self.tls_stream = Some(tls_connector.connect(self.host.as_str(), stream).map_err(Error::Handshake)?);
-        Ok(())
-    }
-
-    /// This function reads a TCP stream until a CLRF `[13, 10]` is sent then collects into a [Vec]
-    fn read_stream(&mut self) -> Result<Vec<u8>> {
-
-        if self.tls && self.tls_stream.is_some() {
-            let mut reader = BufReader::new(self.tls_stream.as_mut().unwrap());
-            let mut data: Vec<u8> = vec![];
-    
-            loop{
-                let buffer = reader.fill_buf();      
-                match buffer {
-                    Ok(bytes) => {
-                        let length = bytes.len();
-                        data.extend_from_slice(bytes); 
-                        reader.consume(length);
-                        // Okay checks for CLFR if more than one byte is in buffer
-                        if (data.len() > 1) && (&data[data.len()-2..] == [13, 10]){
-                            break;
-                        }
-                    },
-                    _ => {}
-                }      
-            }
-            Ok(data)
-        }else{
-            let mut reader = BufReader::new(self.stream.as_ref().unwrap());
-            let mut data: Vec<u8> = vec![];
-    
-            loop{
-                let buffer = reader.fill_buf();      
-                match buffer {
-                    Ok(bytes) => {
-                        let length = bytes.len();
-                        data.extend_from_slice(bytes); 
-                        reader.consume(length);
-                        // Okay checks for CLFR if more than one byte is in buffer
-                        if (data.len() > 1) && (&data[data.len()-2..] == [13, 10]){
-                            break;
-                        }
-                    },
-                    _ => {}
-                }      
-            }
-            Ok(data)
-        }
-    }
-
-    /// wrapper around std::io::write for my streams
-    fn write_stream(&mut self, msg: String) -> Result<()> {
-        if self.tls_stream.is_some(){
-            self.tls_stream.as_mut().ok_or(Error::TLSStreamNotFound)?.write_all((msg+CRLF).as_bytes()).map_err(Error::IO)?;
-        } else{
-            self.stream.as_mut().ok_or(Error::TLSStreamNotFound)?.write_all((msg+CRLF).as_bytes()).map_err(Error::IO)?;
-        }
-        Ok(())
-    }
-
     /// When called it will send an email based on the builders gathered variables
     /// 
-    pub fn send(&mut self) -> Result<()>{
+    pub fn send(&self) -> Result<()>{
 
         // Connect to remote host
-        self.connect()?;
+        let mut stream = self.connect()?;
         
         // Start TLS if specified by user
         if self.tls {
-            self.start_tls().expect("TLS Failed to Connect");
+            self.command(&mut stream, "STARTTLS".into())?;
+            stream.start_tls(&self.host).expect("TLS Failed to Connect");
         }
 
         // EHLO
-        self.command(format!("EHLO {}", self.sender_domain))?;
+        self.command(&mut stream, format!("EHLO {}", self.sender_domain))?;
 
         // Authenticate
         if self.auth_login {
-            self.command("AUTH LOGIN".into())?;
-            self.command(self.username.to_owned().unwrap_or("".into()))?;
-            self.command(self.password.to_owned().unwrap_or("".into()))?;
+            self.command(&mut stream, "AUTH LOGIN".into())?;
+            self.command(&mut stream, self.username.to_owned().unwrap_or("".into()))?;
+            self.command(&mut stream, self.password.to_owned().unwrap_or("".into()))?;
         }
         // Authenticate
         if self.auth_plain {
-            self.command(format!("AUTH PLAIN {}", self.username.to_owned().unwrap_or("".into())))?;
+            self.command(&mut stream, format!("AUTH PLAIN {}", self.username.to_owned().unwrap_or("".into())))?;
         }
 
         // Mail from
-        self.command(format!("MAIL FROM: <{}>", self.sender))?;
+        self.command(&mut stream, format!("MAIL FROM: <{}>", self.sender))?;
 
         // Mail to
-        self.command(format!("RCPT TO: <{}>", self.recipient))?;
+        self.command(&mut stream, format!("RCPT TO: <{}>", self.recipient))?;
 
         // Init Data Send
-        self.command("DATA".into())?;
+        self.command(&mut stream, "DATA".into()).unwrap();
 
+        // Email is build field by field, not from raw bytes
         if self.raw_bytes.is_empty(){
             // Send the Data after formatting
-            self.command(self.format_data()?).expect("Email rejected by forward mail server");
+            self.command(&mut stream, self.format_data()?)?;
+        // Raw bytes are used to send
         }else{
-            self.command(String::from_utf8(self.raw_bytes.clone()).unwrap()).expect("Email rejected by forward mail server");
+            self.command(&mut stream, String::from_utf8(self.raw_bytes.clone()).unwrap())?;
         }
 
+        // Quit the stream at the end
+        self.command(&mut stream, "QUIT".to_string())?;
+    
         Ok(())
     }
 
@@ -417,7 +329,7 @@ impl SmtpBuilder{
         Ok(data)
     }
 
-    fn command(&mut self, msg: String) -> Result<StatusCodes>{
+    fn command(&self, stream: &mut Stream, msg: String) -> Result<StatusCodes>{
 
         if msg.find("From: ").is_none(){
             println!("C: \"{}\" to {}:{}", msg, self.host, self.port);
@@ -426,10 +338,10 @@ impl SmtpBuilder{
             let mut file = std::fs::File::create("out.log").map_err(Error::IO)?;
             file.write_all(msg.as_bytes()).map_err(Error::IO)?;
         }
-        self.write_stream(msg)?;
-        let buf = self.read_stream()?;
+        stream.write(msg)?;
+        let buffer = stream.read()?;
 
-        let status = StatusCodes::lookup(&buf)?;
+        let status = StatusCodes::lookup(&buffer)?;
         println!("S: {:?} from {}:{}", status, self.host, self.port);
 
         Ok(status)
